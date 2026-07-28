@@ -1,0 +1,1882 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code><![CDATA[extensions [csv table]
+
+breed [people person]
+undirected-link-breed [household-links household-link]
+undirected-link-breed [friend-links friend-link]
+
+globals [
+  rewiring-events
+  death-count          ;; cumulative count of agents removed by a simulated CVD event
+  t_lag_months         ;; lag-time in ticks (months) before a behaviour's RR reaches full strength
+  sex-probs           ;; list of [Sex Probability] rows from sex.csv
+  age-dist-male        ;; list of 72 probabilities for ages 18..89, from age_distribution.csv
+  age-dist-female
+  employed-lookup      ;; table: key "Sex-Age" -> % employed (0-100), from employed.csv
+  next-household-id    ;; NEW -- running counter so newly-formed households never collide with setup ids
+  new-residents-count  ;; NEW -- cumulative count of agents added via add-new-residents (city inflow)
+  annual_inflow         ;; NEW -- expected number of new 18+ adults added to the city per year.
+                        ;;         Declared here as a plain global so the model works with no interface
+                        ;;         changes. If you'd rather control it from a slider instead, delete this
+                        ;;         line AND the "set annual_inflow 10" line below, then add a slider on
+                        ;;         the Interface tab bound to a global called "annual_inflow" -- but not
+                        ;;         both at once, NetLogo won't allow the same name declared twice.
+  city-capacity         ;; NEW -- soft population ceiling (housing/resource limit). Inflow is throttled
+                        ;;         once the city is at/near this size, same idea as any real city running
+                        ;;         out of housing stock.
+  monthly-outmigration-prob  ;; NEW -- baseline monthly chance ANY resident (any age) moves away from the
+                        ;;         city for non-health reasons (job, family, relocation). This is the
+                        ;;         second exit route a real city has besides death -- without it, healthy
+                        ;;         young inflow just accumulates forever since they almost never die.
+  out-migrant-count     ;; NEW -- cumulative count of agents removed via out-migration (kept separate
+                        ;;         from death-count -- these agents didn't have a CVD event, they moved)
+]
+
+people-own [
+  household-id
+  sex                ;; "Male" / "Female"   -- sampled from sex.csv
+  age                ;; integer 18-89       -- sampled from age_distribution.csv, conditional on sex
+  age-months          ;; 0-11, counts months since last birthday (tick = month)
+  employed?          ;; boolean             -- sampled from employed.csv, conditional on sex+age
+                      ;;                        (IMD not yet modelled -- see note in load-parameters)
+  smoking-level      ;; 0 = never smoked, 1 = ex-smoker, 2 = current smoker
+  alcohol-level      ;; 0-2
+  diet-level         ;; 0-2
+  inactivity-level   ;; 0-2
+  smoking-level-months     ;; consecutive ticks (months) spent at the CURRENT level -- drives t_lag ramp
+  alcohol-level-months
+  diet-level-months
+  inactivity-level-months
+  risk-score         ;; 0-8, sum of the four levels above (display/colour proxy only)
+]
+
+;; ================= PARAMETER LOADING (B.1 demographic attributes) =================
+;; sex.csv, age_distribution.csv and employed.csv must sit in the same folder as this .nlogox
+
+to load-parameters
+  ;; ---- sex.csv : Sex,Probability ----
+  set sex-probs but-first csv:from-file "sex.csv"
+
+  ;; ---- age_distribution.csv : Sex,18,19,...,89  (P(age|sex), each row sums to ~1) ----
+  foreach but-first csv:from-file "age_distribution.csv" [ row ->
+    ifelse (item 0 row) = "Male"
+      [ set age-dist-male but-first row ]
+      [ set age-dist-female but-first row ]
+  ]
+
+  ;; ---- employed.csv : Sex,IMD,18,19,...,89  (% employed) ----
+  ;; NOTE: in the supplied data, % employed is identical across all 5 IMD quintiles for a
+  ;; given sex/age, so IMD is deliberately NOT modelled as an agent attribute yet -- this
+  ;; lookup just keys on Sex+Age. If a future employed.csv varies by IMD, re-key this table
+  ;; once quintiles.csv (P(IMD|age,sex)) is also added and an `imd` attribute exists.
+  set employed-lookup table:make
+  foreach but-first csv:from-file "employed.csv" [ row ->
+    let s item 0 row
+    let pcts sublist row 2 (length row)
+    (foreach pcts (range 18 90) [ [pct a] -> table:put employed-lookup (word s "-" a) pct ])
+  ]
+end
+
+to-report sample-sex
+  let r random-float 1
+  let cum 0
+  foreach sex-probs [ pair ->
+    set cum cum + (item 1 pair)
+    if r <= cum [ report item 0 pair ]
+  ]
+  report item 0 last sex-probs
+end
+
+to-report sample-age [s]
+  let dist ifelse-value (s = "Male") [ age-dist-male ] [ age-dist-female ]
+  let r random-float 1
+  let cum 0
+  let idx 0
+  foreach dist [ p ->
+    set cum cum + p
+    if r <= cum [ report 18 + idx ]
+    set idx idx + 1
+  ]
+  report 89
+end
+
+to-report lookup-employed-pct [s a]
+  let key (word s "-" a)
+  ifelse table:has-key? employed-lookup key
+    [ report table:get employed-lookup key ]
+    [ report 0 ]
+end
+
+;; ================= SETUP =================
+
+to setup
+  clear-all
+  set rewiring-events 0
+  set death-count 0
+  set new-residents-count 0
+  set annual_inflow 10   ;; NEW -- default city inflow rate: 10 new adults/year. Edit this number directly.
+  set city-capacity N_h * 5           ;; NEW -- ceiling = same max household size (5) x N_h households;
+                                       ;;         edit directly, or scale it off N_h if you change N_h
+  set monthly-outmigration-prob 0.0025  ;; NEW -- ~3%/year baseline turnover; typical range for city-level
+                                       ;;         in/out migration -- edit directly to sweep as a parameter
+  set out-migrant-count 0
+  set t_lag_months t_lag_years * 12    ;; t_lag_years is a slider (default 5, per sourced value)
+  load-parameters
+  create-households
+  set next-household-id N_h            ;; NEW -- household ids 0..N_h-1 are taken; new households start here
+  assign-behaviours
+  create-household-links
+  create-initial-friendships
+  update-risk-and-colors
+  reset-ticks
+end
+
+to create-households
+  let hh 0
+  repeat N_h [
+    let hh-size 1 + random 5              ;; Na in {1..5}, per toy-model spec
+    let cx random-xcor
+    let cy random-ycor
+    repeat hh-size [
+      create-people 1 [
+        set household-id hh
+        set sex sample-sex
+        set age sample-age sex
+        set age-months 0
+        set employed? (random-float 100 < lookup-employed-pct sex age)
+        set shape "person"
+        set size 1.3
+        setxy (cx + random-float 1.6 - 0.8) (cy + random-float 1.6 - 0.8)
+      ]
+    ]
+    set hh hh + 1
+  ]
+end
+
+to assign-behaviours
+  ask people [
+    set smoking-level random 3
+    set alcohol-level random 3
+    set diet-level random 3
+    set inactivity-level random 3
+    set smoking-level-months 0
+    set alcohol-level-months 0
+    set diet-level-months 0
+    set inactivity-level-months 0
+  ]
+end
+
+;; static, fully-connected within household
+to create-household-links
+  ask people [
+    let me self
+    ask other people with [household-id = [household-id] of me and who > [who] of me] [
+      create-household-link-with me [ set color grey  set thickness 0.05 ]
+    ]
+  ]
+end
+
+;; initial random cross-household friendships, up to F_max
+to create-initial-friendships
+  ask people [
+    let me self
+    let slots F_max - count my-friend-links
+    if slots > 0 [
+      let candidates other people with [
+        household-id != [household-id] of me and
+        not friend-link-neighbor? me
+      ]
+      if any? candidates [
+        let partners n-of (min (list slots count candidates)) candidates
+        ask partners [
+          if count my-friend-links < F_max [
+            create-friend-link-with me [ set color sky  set thickness 0.03 ]
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+;; ================= GO =================
+
+to go
+  if not any? people [ stop ]
+  if ticks mod gamma_behavior = 0 [ behaviour-update ]
+  relapse-check                              ;; NEW -- p_relapse is a monthly hazard, so checked every tick
+  if ticks mod gamma_net = 0      [ friendship-update ]
+  update-risk-and-colors
+  test-for-death                             ;; NEW -- QRISK3-lite baseline x behaviour RR x lag ramp
+  check-out-migration                        ;; NEW -- monthly out-migration hazard (2nd exit route besides death)
+  age-and-duration-up                        ;; NEW -- age (every 12 ticks) + level-duration counters
+  if ticks > 0 and ticks mod 12 = 0 [ add-new-residents ]   ;; NEW -- annual inflow of 18+ adults (city renewal)
+  tick
+end
+
+;; ---- 8. Out-migration (city churn) ----
+;; A real city doesn't just lose people to death -- people also move away for jobs, family, or
+;; retirement elsewhere. Without this, the only exit route is death, and since young inflow
+;; agents have a near-zero CVD death probability, they never leave -- the population just
+;; accumulates without limit. This gives every resident, regardless of age or health, a small
+;; ongoing chance of leaving the city, so inflow has something to balance against.
+to check-out-migration
+  ask people [
+    if random-float 1 < monthly-outmigration-prob [
+      set out-migrant-count out-migrant-count + 1
+      die
+    ]
+  ]
+end
+
+;; ---- 7. Population inflow (city renewal) ----
+;; A real city is not a closed cohort: every year some residents turn 18 within existing
+;; households, and others move into the city and form new households. Without this, the
+;; model is a pure one-way attrition process -- with no births/in-migration and a non-zero
+;; monthly death hazard for every agent, the population is mathematically guaranteed to hit
+;; zero if you run it for long enough. This procedure keeps the city "alive" the way a real
+;; settlement is: a churn of inflow and outflow, not a single ageing cohort running out.
+;;
+;; annual_inflow (global, default 10, set in setup) = expected number of new adults added per
+;; year. Actual number drawn from a Poisson distribution around that mean, so year-to-year inflow isn't perfectly constant.
+;; existing-household-join-prob = share of newcomers who join an under-capacity existing
+;; household (a child of that household turning 18) vs. forming a brand-new household
+;; (in-migration to the city). Kept as a hardcoded constant for now -- promote to a slider if
+;; you want to sweep it as an experimental parameter.
+to add-new-residents
+  let existing-household-join-prob 0.3
+  let room city-capacity - count people
+  if room <= 0 [ stop ]                          ;; NEW -- city is at capacity, no inflow this year
+  let n-new min (list (random-poisson annual_inflow) room)   ;; NEW -- never overshoot the ceiling
+  repeat n-new [
+    ifelse (random-float 1 < existing-household-join-prob) and
+           any? people with [count my-household-links + 1 < 5]
+    [
+      ;; --- joins an existing under-capacity household, e.g. a child turning 18 ---
+      let host one-of people with [count my-household-links + 1 < 5]
+      let hh [household-id] of host
+      let hx [xcor] of host
+      let hy [ycor] of host
+      create-people 1 [
+        set household-id hh
+        set sex sample-sex
+        set age 18
+        set age-months 0
+        set employed? (random-float 100 < lookup-employed-pct sex age)
+        set shape "person"
+        set size 1.3
+        setxy (hx + random-float 1.6 - 0.8) (hy + random-float 1.6 - 0.8)
+        set smoking-level random 3
+        set alcohol-level random 3
+        set diet-level random 3
+        set inactivity-level random 3
+        set smoking-level-months 0
+        set alcohol-level-months 0
+        set diet-level-months 0
+        set inactivity-level-months 0
+        let me self
+        ask other people with [household-id = hh] [
+          create-household-link-with me [ set color grey  set thickness 0.05 ]
+        ]
+      ]
+    ]
+    [
+      ;; --- forms a brand-new household (in-migration to the city) ---
+      let hh next-household-id
+      set next-household-id next-household-id + 1
+      let hh-size 1 + random 3     ;; new-arrival households skew smaller than setup's 1-5 range
+      let cx random-xcor
+      let cy random-ycor
+      repeat hh-size [
+        create-people 1 [
+          set household-id hh
+          set sex sample-sex
+          set age 18
+          set age-months 0
+          set employed? (random-float 100 < lookup-employed-pct sex age)
+          set shape "person"
+          set size 1.3
+          setxy (cx + random-float 1.6 - 0.8) (cy + random-float 1.6 - 0.8)
+          set smoking-level random 3
+          set alcohol-level random 3
+          set diet-level random 3
+          set inactivity-level random 3
+          set smoking-level-months 0
+          set alcohol-level-months 0
+          set diet-level-months 0
+          set inactivity-level-months 0
+        ]
+      ]
+      ask people with [household-id = hh] [
+        let me self
+        ask other people with [household-id = hh and who > [who] of me] [
+          create-household-link-with me [ set color grey  set thickness 0.05 ]
+        ]
+      ]
+    ]
+    set new-residents-count new-residents-count + 1
+  ]
+  ;; give newcomers a starting set of cross-household friendships too, same rule as setup
+  create-initial-friendships
+end
+
+;; ---- 1. Behaviour Update Rule ----
+;; household influence > friend influence (matching paper hierarchy)
+to behaviour-update
+  ask people [
+    update-one-behaviour "smoking"
+    update-one-behaviour "alcohol"
+    update-one-behaviour "diet"
+    update-one-behaviour "inactivity"
+  ]
+end
+
+to update-one-behaviour [b]
+  let hh-levels []
+  let fr-levels []
+  ask household-link-neighbors [ set hh-levels lput (get-level b) hh-levels ]
+  ask friend-link-neighbors    [ set fr-levels lput (get-level b) fr-levels ]
+
+  let hh-mean ifelse-value (empty? hh-levels) [ -1 ] [ mean hh-levels ]
+  let fr-mean ifelse-value (empty? fr-levels) [ -1 ] [ mean fr-levels ]
+
+  let w-h influence_weight_household
+  ;; beta_peer (sourced "how much influence friends have on a person's behaviour", 0.25-0.33
+  ;; range) is mapped onto influence_weight_friend per the D.2 reinterpretation -- the 0.4
+  ;; change-trigger gap below is left as a separate, still-unsourced parameter.
+  let w-f influence_weight_friend
+  let w-a omega_age    ;; NEW -- weight on the age-driven pull, see age-target below for sourcing
+  let age-mean age-target b age    ;; NEW -- age-driven pull, always defined (no -1 case needed)
+
+  let total-w 0
+  let weighted-sum 0
+  if hh-mean >= 0 [ set total-w total-w + w-h  set weighted-sum weighted-sum + w-h * hh-mean ]
+  if fr-mean >= 0 [ set total-w total-w + w-f  set weighted-sum weighted-sum + w-f * fr-mean ]
+  if w-a > 0      [ set total-w total-w + w-a  set weighted-sum weighted-sum + w-a * age-mean ]   ;; NEW
+
+  if total-w > 0 [
+    let target weighted-sum / total-w
+    let current get-level b
+    let new-level current
+    if target > current + 0.4 [ set new-level min (list 2 (current + 1)) ]
+    if target < current - 0.4 [ set new-level max (list 0 (current - 1)) ]
+
+    ;; special rule: never-smoked (level 0) can never be regained
+    ifelse b = "smoking" [
+      if not (new-level = 0 and current > 0) [ set-level b new-level ]
+    ] [
+      set-level b new-level
+    ]
+  ]
+end
+
+to-report get-level [b]
+  if b = "smoking"    [ report smoking-level ]
+  if b = "alcohol"    [ report alcohol-level ]
+  if b = "diet"       [ report diet-level ]
+  if b = "inactivity" [ report inactivity-level ]
+  report 0
+end
+
+to set-level [b v]
+  let old get-level b
+  if b = "smoking"    [ set smoking-level v      if v != old [ set smoking-level-months 0 ] ]
+  if b = "alcohol"    [ set alcohol-level v      if v != old [ set alcohol-level-months 0 ] ]
+  if b = "diet"       [ set diet-level v         if v != old [ set diet-level-months 0 ] ]
+  if b = "inactivity" [ set inactivity-level v   if v != old [ set inactivity-level-months 0 ] ]
+end
+
+;; ---- 2. Friendship Adaptation Rule ----
+;; (dynamic-relationship idea adapted from DynamiX's homophily-based
+;;  follow/unfollow mechanism, simplified for a toy ABM)
+to friendship-update
+  ;; (a) evaluate existing friendships: mismatch > theta_tol -> probabilistic removal
+  ask people [
+    let me self
+    ask my-friend-links [
+      let other-person other-end
+      let mismatch behaviour-mismatch me other-person
+      if mismatch > theta_tol [
+        let removal-prob (mismatch - theta_tol) / (8 - theta_tol + 0.0001)
+        if random-float 1 < removal-prob [
+          die
+          set rewiring-events rewiring-events + 1
+        ]
+      ]
+    ]
+  ]
+
+  ;; (b) if below F_max, seek a new friend from another household by homophily
+  ask people [
+    let me self
+    if count my-friend-links < F_max [
+      let candidates other people with [
+        household-id != [household-id] of me and
+        not friend-link-neighbor? me
+      ]
+      if any? candidates [
+        let best min-one-of candidates [ behaviour-mismatch me self ]
+        if best != nobody [
+          if count [my-friend-links] of best < F_max [
+            create-friend-link-with best [ set color sky  set thickness 0.03 ]
+            set rewiring-events rewiring-events + 1
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+to-report behaviour-mismatch [a b]
+  report (abs ([smoking-level] of a - [smoking-level] of b) +
+          abs ([alcohol-level] of a - [alcohol-level] of b) +
+          abs ([diet-level] of a - [diet-level] of b) +
+          abs ([inactivity-level] of a - [inactivity-level] of b))
+end
+
+to-report get-level-months [b]
+  if b = "smoking"    [ report smoking-level-months ]
+  if b = "alcohol"    [ report alcohol-level-months ]
+  if b = "diet"       [ report diet-level-months ]
+  if b = "inactivity" [ report inactivity-level-months ]
+  report 0
+end
+
+;; ---- 3. Relapse Rule ----
+;; p_relapse (sourced: 0.05/month) is an INDEPENDENT stochastic hazard, separate from the
+;; deterministic weighted-average pull in update-one-behaviour. It only fires for an agent who
+;; is NOT already at the riskiest level (2), and only when a majority (>= relapse_friend_threshold)
+;; of their friends are still at the riskiest level -- i.e. "quit, but surrounded by the habit".
+;; Checked every tick (not gated by gamma_behavior) since p_relapse is itself a per-month rate.
+to relapse-check
+  ask people [
+    relapse-one-behaviour "smoking"
+    relapse-one-behaviour "alcohol"
+    relapse-one-behaviour "diet"
+    relapse-one-behaviour "inactivity"
+  ]
+end
+
+to relapse-one-behaviour [b]
+  let current get-level b
+  if current < 2 [
+    let fr-levels []
+    ask friend-link-neighbors [ set fr-levels lput (get-level b) fr-levels ]
+    if not empty? fr-levels [
+      let frac-high (length filter [ l -> l = 2 ] fr-levels) / (length fr-levels)
+      if frac-high >= relapse_friend_threshold [
+        if random-float 1 < p_relapse [
+          ;; smoking level-0 ("never smoked") irreversibility rule is preserved: relapse cannot
+          ;; move a never-smoker to level 1 -- only agents already at level 1 (ex-smoker) can
+          ;; relapse to level 2, matching real "quit, then relapse" semantics
+          if not (b = "smoking" and current = 0) [
+            set-level b (current + 1)
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+;; ---- 4. CVD Risk Model ----
+;; Baseline R0(age,sex): exact simplified-QRISK3 formulation reused from the base paper
+;; (Archbold et al. 2024, agent.py base_cvd_male/base_cvd_female), with the same fixed
+;; population-default BMI/cholesterol-ratio/SBP/SBP-variability constants. Source:
+;; Hippisley-Cox et al. (2017), BMJ. Returns a 10-YEAR probability (0-1).
+to-report base-cvd-female [a]
+  let bmi 26.8   let rati 3.5   let sbp 123   let sbps5 5
+  let dage a / 10.0
+  let age_1 (dage ^ -2) - 0.053274843841791
+  let age_2 dage - 4.332503318786621
+  let dbmi bmi / 10.0
+  let bmi_1 (dbmi ^ -2) - 0.154946178197861
+  let bmi_2 ((dbmi ^ -2) * (ln dbmi)) - 0.144462317228317
+  let rati2 rati - 3.476326465606690
+  let sbp2 sbp - 123.130012512207030
+  let sbps52 sbps5 - 9.002537727355957
+  let a-sum 0
+  set a-sum a-sum + age_1 * -8.1388109247726188
+  set a-sum a-sum + age_2 * 0.7973337668969909800
+  set a-sum a-sum + bmi_1 * 0.2923609227546005200
+  set a-sum a-sum + bmi_2 * -4.1513300213837665
+  set a-sum a-sum + rati2 * 0.1533803582080255400
+  set a-sum a-sum + sbp2 * 0.0131314884071034240
+  set a-sum a-sum + sbps52 * 0.0078894541014586095
+  set a-sum a-sum + age_1 * bmi_1 * 23.8026234121417420
+  set a-sum a-sum + age_1 * bmi_2 * -71.1849476920870070
+  set a-sum a-sum + age_1 * sbp2 * 0.0341318423386154850
+  set a-sum a-sum + age_2 * bmi_1 * 0.5236995893366442900
+  set a-sum a-sum + age_2 * bmi_2 * 0.0457441901223237590
+  set a-sum a-sum + age_2 * sbp2 * -0.0015082501423272358
+  let score 100 * (1 - (0.988876402378082 ^ (exp a-sum)))
+  report score / 100
+end
+
+to-report base-cvd-male [a]
+  let bmi 27.7   let rati 4.1   let sbp 130   let sbps5 7
+  let dage a / 10.0
+  let age_1 (dage ^ -1) - 0.234766781330109
+  let age_2 (dage ^ 3) - 77.284080505371094
+  let dbmi bmi / 10.0
+  let bmi_1 (dbmi ^ -2) - 0.149176135659218
+  let bmi_2 ((dbmi ^ -2) * (ln dbmi)) - 0.141913309693336
+  let rati2 rati - 4.300998687744141
+  let sbp2 sbp - 128.571578979492190
+  let sbps52 sbps5 - 8.756621360778809
+  let a-sum 0
+  set a-sum a-sum + age_1 * -17.8397816660055750
+  set a-sum a-sum + age_2 * 0.0022964880605765492
+  set a-sum a-sum + bmi_1 * 2.4562776660536358
+  set a-sum a-sum + bmi_2 * -8.3011122314711354
+  set a-sum a-sum + rati2 * 0.1734019685632711100
+  set a-sum a-sum + sbp2 * 0.0129101265425533050
+  set a-sum a-sum + sbps52 * 0.0102519142912904560
+  set a-sum a-sum + age_1 * bmi_1 * 31.0049529560338860
+  set a-sum a-sum + age_1 * bmi_2 * -111.2915718439164300
+  set a-sum a-sum + age_1 * sbp2 * 0.0188585244698658530
+  set a-sum a-sum + age_2 * bmi_1 * 0.0050380102356322029
+  set a-sum a-sum + age_2 * bmi_2 * -0.0130744830025243190
+  set a-sum a-sum + age_2 * sbp2 * -0.0000127187419158845700
+  let score 100 * (1 - (0.977268040180206 ^ (exp a-sum)))
+  report score / 100
+end
+
+;; Relative-risk lookup tables. Each returns a multiplier for a given ordinal level (0/1/2).
+;; STATUS is marked per table -- see Part D / D.2 of the parameter documentation for full sourcing.
+to-report rr-smoke [lvl]
+  ;; SOURCED (dose-mapped: level 2 = "20 cigarettes/day" RR, the heavier/upper-bound figure).
+  ;; Level 1 (ex-smoker) is PROVISIONAL -- still needs Mons et al. (2015) cessation-risk figure.
+  if lvl = 0 [ report 1.0 ]
+  if lvl = 1 [ report ifelse-value (sex = "Male") [ 1.3 ] [ 1.4 ] ]   ;; PROVISIONAL
+  report ifelse-value (sex = "Male") [ 2.27 ] [ 3.95 ]                 ;; SOURCED
+end
+
+to-report rr-alcohol [lvl]
+  ;; The sourced J-shaped table (regular heavy 0.75 / binge 1.10 / protective dose 0.85) maps
+  ;; awkwardly onto 3 ordinal levels and makes the RISKIEST level look "protective" if used as-is.
+  ;; DEFAULT below is a monotonic fallback (PROVISIONAL magnitudes). The J-shaped Track-B
+  ;; alternative is left commented out -- swap the two blocks to run that robustness scenario.
+  if lvl = 0 [ report 1.0 ]
+  if lvl = 1 [ report 1.3 ]
+  report 1.6
+  ;; ---- Track B (J-shaped, as sourced) -- comment out the block above and uncomment this ----
+  ;; if lvl = 0 [ report 0.85 ]
+  ;; if lvl = 1 [ report 1.10 ]
+  ;; report 0.75
+end
+
+to-report rr-diet [lvl]
+  ;; PROVISIONAL composite. Sourced GBD table gives 5 separate nutrient risk factors, not yet
+  ;; collapsed into one number -- direction/ordering is sourced, magnitudes are illustrative.
+  if lvl = 0 [ report 1.0 ]
+  if lvl = 1 [ report 1.15 ]
+  report 1.3
+end
+
+to-report rr-activity [lvl]
+  ;; PARTIALLY SOURCED -- only the upper bound is known (RRactivity < 1.5). Level breakdown below
+  ;; is illustrative and should be revisited once a level-by-level source is found.
+  if lvl = 0 [ report 1.0 ]
+  if lvl = 1 [ report 1.2 ]
+  report 1.45
+end
+
+;; Lag Time (t_lag, sourced = 5 years): a behaviour's RR ramps linearly from neutral (1x) to
+;; full strength over t_lag_months, rather than applying instantly -- covers both onset of
+;; elevated risk AND the gradual fall in risk after adopting a healthier level (since
+;; set-level resets the duration counter to 0 on ANY change, the ramp restarts either way).
+;; ---- Age Effect (omega_age) ----
+;; behaviour_cvd_prevalence.csv (the base paper's actual age x sex x behaviour-level prevalence
+;; table) was never supplied, so this is NOT that file. Instead it's built from real, cited
+;; ONS/NHS Digital (Health Survey for England) and Sport England Active Lives published
+;; statistics on how each behaviour's prevalence varies by age band. Each age-target below is a
+;; 0-2 "typical level for this age" pull, min-max scaled from the cited real prevalence figures
+;; -- the DIRECTION and RELATIVE ordering across age bands is sourced; the exact numeric levels
+;; are an illustrative proxy standing in for the real per-level prevalence table, same status as
+;; the other PROVISIONAL entries in the RR tables above. Replace with behaviour_cvd_prevalence.csv
+;; -derived values if/when that file becomes available.
+to-report age-target [b a]
+  if b = "smoking" [
+    ;; ONS (2021): current-smoker prevalence peaks at 25-34 (~20%), falls steadily with age,
+    ;; lowest at 65+ (~5.5-8%)
+    if a < 25  [ report 1.0 ]
+    if a < 35  [ report 1.3 ]
+    if a < 45  [ report 1.0 ]
+    if a < 55  [ report 0.9 ]
+    if a < 65  [ report 0.7 ]
+    if a < 75  [ report 0.5 ]
+    if a < 85  [ report 0.3 ]
+    report 0.2
+  ]
+  if b = "alcohol" [
+    ;; HSE / Commons Library: proportion drinking >14 units/week rises through mid-life,
+    ;; peaks at 55-64 (~28-32%), lower among under-25s (~15-17%) and over-75s
+    if a < 25  [ report 0.8 ]
+    if a < 35  [ report 1.0 ]
+    if a < 45  [ report 1.1 ]
+    if a < 55  [ report 1.2 ]
+    if a < 65  [ report 1.4 ]
+    if a < 75  [ report 1.2 ]
+    if a < 85  [ report 0.8 ]
+    report 0.6
+  ]
+  if b = "diet" [
+    ;; HSE / NDNS: under-25s eat fewest portions of fruit/veg (~3.0-3.3/day, ~22-23% hit
+    ;; 5-a-day); 65-74 eat the most (~3.7/day); slight decline again at 75+ (~3.6/day)
+    if a < 25  [ report 1.3 ]
+    if a < 35  [ report 1.1 ]
+    if a < 45  [ report 1.0 ]
+    if a < 55  [ report 0.9 ]
+    if a < 65  [ report 0.8 ]
+    if a < 75  [ report 0.6 ]
+    if a < 85  [ report 0.7 ]
+    report 0.9
+  ]
+  ;; inactivity
+  ;; Sport England Active Lives: inactivity rises steadily with age -- ~29% overall,
+  ;; ~38.5% at 55-64, ~39.9% at 65-74, ~56.9% at 75-84, ~78.4% at 85+
+  if a < 25  [ report 0.6 ]
+  if a < 35  [ report 0.7 ]
+  if a < 45  [ report 0.8 ]
+  if a < 55  [ report 0.9 ]
+  if a < 65  [ report 1.1 ]
+  if a < 75  [ report 1.2 ]
+  if a < 85  [ report 1.7 ]
+  report 2.0
+end
+
+to-report lag-ramp [months-at-level]
+  report min (list 1 (months-at-level / t_lag_months))
+end
+
+to-report effective-rr [b lvl months-at-level]
+  let full-rr 1
+  if b = "smoking"    [ set full-rr rr-smoke lvl ]
+  if b = "alcohol"    [ set full-rr rr-alcohol lvl ]
+  if b = "diet"       [ set full-rr rr-diet lvl ]
+  if b = "inactivity" [ set full-rr rr-activity lvl ]
+  report 1 + (full-rr - 1) * (lag-ramp months-at-level)
+end
+
+;; ---- 5. Death (CVD event) ----
+;; Combines the QRISK3-lite 10-year baseline (converted to a monthly probability, since
+;; 1 tick = 1 month) with the lag-ramped RR product across all 4 behaviours. On a positive
+;; draw the agent is removed with NetLogo's `die` -- this automatically drops all of that
+;; agent's household-links and friend-links too, so no manual list clean-up is needed (unlike
+;; the base paper's Python agent_death(), which has to manually strip references).
+to test-for-death
+  ask people [
+    let base10 ifelse-value (sex = "Male") [ base-cvd-male age ] [ base-cvd-female age ]
+
+    ;; convert 10-year cumulative probability -> constant annual hazard rate
+    ;; (proper survival-analysis conversion, avoids linear-division bias)
+    let base10-clamped min (list base10 0.999999)   ;; guard against ln(0) if base10 ever hits 1
+    let lambda-annual (- (ln (1 - base10-clamped))) / 10
+
+    let rr (effective-rr "smoking"    smoking-level    smoking-level-months) *
+            (effective-rr "alcohol"    alcohol-level    alcohol-level-months) *
+            (effective-rr "diet"       diet-level       diet-level-months) *
+            (effective-rr "inactivity" inactivity-level inactivity-level-months)
+
+    ;; RR multiplies the hazard rate (correct interpretation of a relative risk),
+    ;; then convert the effective annual hazard down to a monthly probability
+    let lambda-effective lambda-annual * rr
+    let monthly-p 1 - exp (- lambda-effective / 12)
+
+    if random-float 1 < monthly-p [
+      set death-count death-count + 1
+      die
+    ]
+  ]
+end
+
+;; ---- 6. Ageing & duration tracking ----
+to age-and-duration-up
+  ask people [
+    set age-months age-months + 1
+    if age-months >= 12 [ set age age + 1  set age-months 0 ]
+    set smoking-level-months smoking-level-months + 1
+    set alcohol-level-months alcohol-level-months + 1
+    set diet-level-months diet-level-months + 1
+    set inactivity-level-months inactivity-level-months + 1
+  ]
+end
+
+;; ================= RISK & COLOUR =================
+
+to update-risk-and-colors
+  ask people [
+    set risk-score (smoking-level + alcohol-level + diet-level + inactivity-level)
+    set color risk-colour risk-score
+  ]
+end
+
+to-report risk-colour [r]
+  if r <= 2 [ report green ]
+  if r <= 4 [ report yellow ]
+  if r <= 6 [ report orange ]
+  report red
+end
+
+;; ================= MONITOR / PLOT REPORTERS =================
+;; names match NETLOGO_SETUP_GUIDE.md exactly
+
+to-report report-total-agents
+  report count people
+end
+
+to-report report-mean-risk
+  report ifelse-value (any? people) [ mean [risk-score] of people ] [ 0 ]
+end
+
+to-report report-mean-friends
+  report ifelse-value (any? people) [ mean [count my-friend-links] of people ] [ 0 ]
+end
+
+to-report total-friend-links
+  report count friend-links
+end
+
+to-report total-household-links
+  report count household-links
+end
+
+to-report report-rewiring-events
+  report rewiring-events
+end
+
+to-report report-pct-high-smoking
+  report 100 * (count people with [smoking-level = 2]) / (max list 1 count people)
+end
+
+to-report report-pct-high-alcohol
+  report 100 * (count people with [alcohol-level = 2]) / (max list 1 count people)
+end
+
+to-report report-pct-high-diet
+  report 100 * (count people with [diet-level = 2]) / (max list 1 count people)
+end
+
+to-report report-pct-high-inactivity
+  report 100 * (count people with [inactivity-level = 2]) / (max list 1 count people)
+end
+
+to-report report-mean-age
+  report ifelse-value (any? people) [ mean [age] of people ] [ 0 ]
+end
+
+to-report report-pct-employed
+  report 100 * (count people with [employed?]) / (max list 1 count people)
+end
+
+to-report report-deaths
+  report death-count
+end
+
+to-report report-new-residents
+  report new-residents-count
+end
+
+to-report report-out-migrants
+  report out-migrant-count
+end
+
+to-report report-city-capacity
+  report city-capacity
+end]]></code>
+  <widgets>
+    <view x="365" wrappingAllowedX="true" y="30" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="434" tickCounterLabel="ticks" maxPycor="16" updateMode="1" maxPxcor="16" minPxcor="-16"></view>
+    <button x="40" y="25" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55" display="SETUP">setup</button>
+    <button x="115" y="25" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55" display="GO">go</button>
+    <button x="195" y="25" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="70" display="GO ONCE">go</button>
+    <slider x="40" step="10" y="95" max="100" width="250" display="N_h" height="50" min="10" direction="Horizontal" default="80.0" variable="N_h"></slider>
+    <slider x="40" step="0.5" y="165" max="3" width="246" display="gamma_net" height="50" min="1" direction="Horizontal" default="3.0" variable="gamma_net"></slider>
+    <slider x="40" step="1" y="305" max="8" width="250" display="theta_tol" height="50" min="0" direction="Horizontal" default="8.0" variable="theta_tol"></slider>
+    <slider x="40" step="1" y="375" max="10" width="250" display="F_max" height="50" min="1" direction="Horizontal" default="10.0" variable="F_max"></slider>
+    <slider x="40" step="0.5" y="445" max="1" width="250" display="influence_weight_household" height="50" min="0" direction="Horizontal" default="0.5" variable="influence_weight_household"></slider>
+    <slider x="40" step="0.01" y="590" max="0.2" width="250" display="p_relapse" height="50" min="0" direction="Horizontal" default="0.05" variable="p_relapse"></slider>
+    <slider x="40" step="0.05" y="660" max="1" width="250" display="relapse_friend_threshold" height="50" min="0" direction="Horizontal" default="0.5" variable="relapse_friend_threshold"></slider>
+    <slider x="40" step="1" y="730" max="10" width="250" display="t_lag_years" height="50" min="0" direction="Horizontal" default="5.0" variable="t_lag_years"></slider>
+    <slider x="40" step="0.05" y="800" max="1" width="250" display="omega_age" height="50" min="0" direction="Horizontal" default="0.0" variable="omega_age"></slider>
+    <monitor x="830" precision="17" y="30" height="60" fontSize="11" width="100" display="Total Agents">report-total-agents</monitor>
+    <monitor x="830" precision="17" y="105" height="60" fontSize="11" width="100" display="Mean Risk Score">report-mean-risk</monitor>
+    <monitor x="830" precision="17" y="180" height="60" fontSize="11" width="100" display="Mean Friend Count">report-mean-friends</monitor>
+    <monitor x="830" precision="17" y="255" height="60" fontSize="11" width="100" display="Total Friend Links">total-friend-links</monitor>
+    <monitor x="830" precision="17" y="330" height="60" fontSize="11" width="100" display="Total Household Links">total-household-links</monitor>
+    <monitor x="830" precision="17" y="405" height="60" fontSize="11" width="100" display="Rewiring Events">report-rewiring-events</monitor>
+    <monitor x="940" precision="17" y="30" height="60" fontSize="11" width="100" display="Mean Age">report-mean-age</monitor>
+    <monitor x="940" precision="17" y="105" height="60" fontSize="11" width="100" display="% Employed">report-pct-employed</monitor>
+    <monitor x="940" precision="17" y="180" height="60" fontSize="11" width="100" display="Deaths">report-deaths</monitor>
+    <plot x="1060" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="% High Risk" y="20" xMin="0.0" height="175" legend="true" xMax="50.0" yMin="0.0" width="230" xAxis="ticks" display="Behaviour Risk Levels">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Smoking" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot report-pct-high-smoking</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Alcohol" color="-817084" legend="true">
+        <setup></setup>
+        <update>plot report-pct-high-alcohol</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Diet" color="-11783835" legend="true">
+        <setup></setup>
+        <update>plot report-pct-high-diet</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Inactivity" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot report-pct-high-inactivity</update>
+      </pen>
+    </plot>
+    <plot x="1060" autoPlotX="true" yMax="8.0" autoPlotY="true" yAxis="Score" y="225" xMin="0.0" height="175" legend="true" xMax="50.0" yMin="0.0" width="230" xAxis="ticks" display="Mean CVD Risk Score">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Risk Score" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot report-mean-risk</update>
+      </pen>
+    </plot>
+    <plot x="1060" autoPlotX="true" yMax="20.0" autoPlotY="true" yAxis="Count / Average" y="420" xMin="0.0" height="175" legend="true" xMax="50.0" yMin="0.0" width="230" xAxis="ticks" display="Friendship Network">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Mean Friends" color="-13791810" legend="true">
+        <setup></setup>
+        <update>plot report-mean-friends</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Rewiring Events" color="-2064490" legend="true">
+        <setup></setup>
+        <update>plot report-rewiring-events</update>
+      </pen>
+    </plot>
+    <slider x="40" step="0.5" y="235" max="2" width="250" display="gamma_behavior" height="50" min="0.5" direction="Horizontal" default="1.0" variable="gamma_behavior"></slider>
+    <slider x="40" step="0.01" y="515" max="0.33" width="250" display="influence_weight_friend" height="50" min="0.25" direction="Horizontal" default="0.29" variable="influence_weight_friend"></slider>
+  </widgets>
+  <info>## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="Experiment_4A_Inflow" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="true" timeLimit="120">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>count turtles</metric>
+        <metric>mean [risk-score] of turtles</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="annual_inflow">
+          <value value="0"></value>
+          <value value="5"></value>
+          <value value="10"></value>
+          <value value="20"></value>
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="monthly-outmigration-prob">
+          <value value="0.0025"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_friend">
+          <value value="0.29"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_net">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relapse_friend_threshold">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p_relapse">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_behavior">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N_h">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t_lag_years">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="theta_tol">
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="omega_age">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_household">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="F_max">
+          <value value="10"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Experiment_4B_Outmigration" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="true" timeLimit="120">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>count turtles</metric>
+        <metric>mean [count link-neighbors] of turtles</metric>
+        <metric>mean [risk-score] of turtles</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="annual_inflow">
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="monthly-outmigration-prob">
+          <value value="0.001"></value>
+          <value value="0.0025"></value>
+          <value value="0.005"></value>
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_friend">
+          <value value="0.29"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_net">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relapse_friend_threshold">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p_relapse">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_behavior">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N_h">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t_lag_years">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="theta_tol">
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="omega_age">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_household">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="F_max">
+          <value value="10"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="Experiment_4C_Growth_Homophily" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="true" timeLimit="120">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>count turtles</metric>
+        <metric>mean [risk-score] of turtles</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="annual_inflow">
+          <value value="10"></value>
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="monthly-outmigration-prob">
+          <value value="0.0025"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_friend">
+          <value value="0.29"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_net">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relapse_friend_threshold">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p_relapse">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="gamma_behavior">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="N_h">
+          <value value="80"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="t_lag_years">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="theta_tol">
+          <value value="2"></value>
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="omega_age">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="influence_weight_household">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="F_max">
+          <value value="10"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
